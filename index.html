@@ -2,7 +2,7 @@
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <title>БПЛА: DQN + физика + ветер (исправленная нейросеть + управление ветром)</title>
+    <title>БПЛА: DQN (стабильная физика + ветер вкл/выкл)</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
     <style>
         body { font-family: sans-serif; background: #1a1a1a; color: #fff; margin: 20px; }
@@ -15,25 +15,25 @@
     </style>
 </head>
 <body>
-    <h2>БПЛА: DQN (исправленный backprop + target network + ветер вкл/выкл)</h2>
+    <h2>БПЛА: DQN (стабильная физика, скорость x1/x4)</h2>
     <div id="canvas-container">
         <div id="wind-hud">Ветер: <span id="wind-text">0.00</span></div>
     </div>
     <div id="controls">
-        <h3>Управление ИИ</h3>
-        <button class="btn" id="speed-btn" style="background:#e91e63;">Скорость: Турбо (15х)</button>
+        <h3>Управление</h3>
+        <button class="btn" id="speed-btn" style="background:#e91e63;">Скорость: 4x (быстро)</button>
         <button class="btn" id="wind-btn" style="background:#2196F3;">Ветер: Вкл</button>
-        <div class="stat">Эпоха (Рестарты): <b id="episodes-count">0</b></div>
-        <div class="stat">Текущий шаг: <b id="steps-count">0</b></div>
+        <div class="stat">Эпоха: <b id="episodes-count">0</b></div>
+        <div class="stat">Шаг: <b id="steps-count">0</b></div>
         <div class="stat">Статус: <b id="drone-status" style="color:#ff9800">Поиск груза</b></div>
         <div class="stat">Награда: <b id="reward-val">0</b></div>
         <div class="stat">ε: <b id="epsilon-val">0.50</b></div>
         <hr style="border-color:#444">
-        <p style="font-size:12px;color:#aaa">Исправленный backprop, целевая сеть, затухающий epsilon, отключение ветра.</p>
+        <p style="font-size:12px;color:#aaa">Исправленный backprop, target net, макс. 4x, стартовая защита.</p>
     </div>
 
     <script>
-        // ========== 1. Нейросеть (исправленный обратный проход) ==========
+        // ========== 1. Нейросеть (исправленный backprop) ==========
         class NeuralNetwork {
             constructor(layers) {
                 this.layers = layers;
@@ -119,17 +119,17 @@
             }
         }
 
-        // ========== 2. DQN Агент с целевой сетью и затуханием ε ==========
+        // ========== 2. DQN Агент ==========
         class DQNAgent {
-            constructor(stateSize, actionSize, learningRate = 0.002, gamma = 0.99,
-                        epsilon = 0.5, epsilonMin = 0.02, epsilonDecay = 0.995) {
+            constructor(stateSize, actionSize, lr = 0.002, gamma = 0.99,
+                        eps = 0.5, epsMin = 0.02, epsDecay = 0.995) {
                 this.stateSize = stateSize;
                 this.actionSize = actionSize;
                 this.gamma = gamma;
-                this.epsilon = epsilon;
-                this.epsilonMin = epsilonMin;
-                this.epsilonDecay = epsilonDecay;
-                this.learningRate = learningRate;
+                this.epsilon = eps;
+                this.epsilonMin = epsMin;
+                this.epsilonDecay = epsDecay;
+                this.learningRate = lr;
 
                 this.model = new NeuralNetwork([stateSize, 128, 64, actionSize]);
                 this.targetModel = new NeuralNetwork([stateSize, 128, 64, actionSize]);
@@ -205,8 +205,8 @@
         // ========== 3. Симуляция ==========
         const { Engine, Render, Bodies, Composite, Body, Constraint, Query } = Matter;
         const WIDTH = 800, HEIGHT = 500;
-        let simSpeed = 15;
-        let windEnabled = true;   // флаг включения ветра
+        let simSpeed = 4;           // макс. 4x (стабильно)
+        let windEnabled = true;
 
         const engine = Engine.create({ gravity: { y: 1, scale: 0.001 } });
         const world = engine.world;
@@ -223,8 +223,13 @@
         const rightWall = Bodies.rectangle(WIDTH-10, HEIGHT/2, 20, HEIGHT, { isStatic: true });
         const obstacle = Bodies.rectangle(400, 360, 40, 260, { isStatic: true, render: { fillStyle: '#d32f2f' } });
 
-        const drone = Bodies.rectangle(100, 430, 60, 15, { density: 0.005, frictionAir: 0.07, render: { fillStyle: '#00e676' } });
-        let cargo = Bodies.rectangle(700, 450, 25, 25, { density: 0.004, render: { fillStyle: '#ff9100' } });
+        // Увеличили плотность/трение для устойчивости
+        const drone = Bodies.rectangle(100, 430, 60, 15, {
+            density: 0.008, frictionAir: 0.1, render: { fillStyle: '#00e676' }
+        });
+        let cargo = Bodies.rectangle(700, 450, 25, 25, {
+            density: 0.006, render: { fillStyle: '#ff9100' }
+        });
         const basePos = { x: 100, y: 450 };
         const staticBodies = [ground, leftWall, rightWall, obstacle];
 
@@ -234,6 +239,7 @@
         let cargoConstraint = null;
         let episodes = 0;
         let totalSteps = 0;
+        let safeSteps = 0;          // счётчик "безопасных" шагов в начале эпизода
 
         let windForceX = 0, windTime = 0;
 
@@ -268,7 +274,7 @@
         }
 
         function applyDronePhysics(action) {
-            const force = 0.052;
+            const force = 0.045;   // чуть уменьшена сила для стабильности
             const angle = drone.angle;
             const forceVector = { x: Math.sin(angle) * force, y: -Math.cos(angle) * force };
             if (action === 1 || action === 3) {
@@ -332,6 +338,7 @@
 
             let done = false;
 
+            // Захват груза
             if (!isCargoAttached && distAfter < 45) {
                 isCargoAttached = true;
                 reward += 150;
@@ -345,18 +352,27 @@
                 document.getElementById('drone-status').style.color = "#00e676";
             }
 
+            // Доставка на базу
             if (isCargoAttached && distAfter < 55 && drone.position.x < 250) {
                 reward += 500;
                 done = true;
             }
 
-            const isUpsideDown = Math.abs(drone.angle) > Math.PI/1.6;
+            // Опасные ситуации
             const hitObstacle = Query.collides(drone, staticBodies).length > 0;
-            if (hitObstacle || drone.position.y < 15 || drone.position.y > HEIGHT) {
+            const outOfBounds = drone.position.y < 15 || drone.position.y > HEIGHT;
+
+            if (hitObstacle || outOfBounds) {
                 reward = -150;
                 done = true;
-            } else if (isUpsideDown && drone.angularVelocity * drone.angle > 0.1) {
-                reward -= 1.0;
+            } else if (safeSteps < 20) {
+                // В первые 20 шагов не штрафуем сильно за перевороты
+                safeSteps++;
+            } else {
+                const isUpsideDown = Math.abs(drone.angle) > Math.PI/1.6;
+                if (isUpsideDown && drone.angularVelocity * drone.angle > 0.1) {
+                    reward -= 1.0;
+                }
             }
 
             agent.remember(state, action, reward, nextState, done);
@@ -386,6 +402,7 @@
         function resetScene() {
             episodes++;
             totalSteps = 0;
+            safeSteps = 0;
             document.getElementById('episodes-count').innerText = episodes;
             document.getElementById('steps-count').innerText = totalSteps;
             if (cargoConstraint) {
@@ -413,12 +430,20 @@
             requestAnimationFrame(gameLoop);
         }
 
+        // Кнопка скорости: 1x / 4x
         document.getElementById('speed-btn').addEventListener('click', () => {
-            simSpeed = simSpeed === 1 ? 15 : 1;
-            document.getElementById('speed-btn').innerText = simSpeed === 15 ? "Скорость: Турбо (15х)" : "Скорость: Обычная (1х)";
-            document.getElementById('speed-btn').style.background = simSpeed === 15 ? "#e91e63" : "#4caf50";
+            simSpeed = simSpeed === 1 ? 4 : 1;
+            const btn = document.getElementById('speed-btn');
+            if (simSpeed === 4) {
+                btn.innerText = 'Скорость: 4x (быстро)';
+                btn.style.background = '#e91e63';
+            } else {
+                btn.innerText = 'Скорость: 1x (обычно)';
+                btn.style.background = '#4caf50';
+            }
         });
 
+        // Ветер вкл/выкл
         document.getElementById('wind-btn').addEventListener('click', () => {
             windEnabled = !windEnabled;
             const btn = document.getElementById('wind-btn');
@@ -428,7 +453,7 @@
             } else {
                 btn.innerText = 'Ветер: Выкл';
                 btn.style.background = '#607D8B';
-                windForceX = 0; // мгновенно убираем ветер
+                windForceX = 0;
             }
         });
 
