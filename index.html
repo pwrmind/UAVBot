@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>БПЛА: DQN + физика + ветер (исправленная нейросеть + целевая сеть)</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
+    <style>
+        body { font-family: sans-serif; background: #1a1a1a; color: #fff; margin: 20px; }
+        #canvas-container { border: 2px solid #444; float: left; position: relative; }
+        #controls { float: left; margin-left: 20px; background: #2a2a2a; padding: 15px; border-radius: 8px; width: 300px; }
+        .btn { background: #e91e63; border: none; color: white; padding: 10px 20px; cursor: pointer; border-radius: 4px; font-weight: bold; width: 100%;}
+        .btn:hover { background: #c2185b; }
+        .stat { margin: 10px 0; font-size: 14px; }
+        #wind-hud { position: absolute; top: 15px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.6); padding: 5px 15px; border-radius: 15px; font-size: 14px; pointer-events: none; border: 1px solid #555; }
+    </style>
+</head>
+<body>
+    <h2>БПЛА: DQN (исправленный backprop + target network)</h2>
+    <div id="canvas-container">
+        <div id="wind-hud">Ветер: <span id="wind-text">0.00</span></div>
+    </div>
+    <div id="controls">
+        <h3>Управление ИИ</h3>
+        <button class="btn" id="speed-btn">Скорость: Турбо (15х)</button>
+        <div class="stat">Эпоха (Рестарты): <b id="episodes-count">0</b></div>
+        <div class="stat">Текущий шаг: <b id="steps-count">0</b></div>
+        <div class="stat">Статус: <b id="drone-status" style="color:#ff9800">Поиск груза</b></div>
+        <div class="stat">Награда: <b id="reward-val">0</b></div>
+        <div class="stat">ε: <b id="epsilon-val">0.50</b></div>
+        <hr style="border-color:#444">
+        <p style="font-size:12px;color:#aaa">Исправленный backprop, целевая сеть, затухающий epsilon.</p>
+    </div>
+
+    <script>
+        // ========== 1. Нейросеть (исправленный обратный проход) ==========
+        class NeuralNetwork {
+            constructor(layers) {
+                this.layers = layers;
+                this.weights = [];
+                this.biases = [];
+                for (let i = 1; i < layers.length; i++) {
+                    let w = new Array(layers[i]);
+                    for (let j = 0; j < layers[i]; j++) {
+                        w[j] = new Array(layers[i-1]);
+                        for (let k = 0; k < layers[i-1]; k++) {
+                            w[j][k] = (Math.random() * 2 - 1) * Math.sqrt(2 / layers[i-1]);
+                        }
+                    }
+                    this.weights.push(w);
+                    this.biases.push(new Array(layers[i]).fill(0));
+                }
+            }
+
+            // Прямой проход с сохранением z (до активации) и a (после)
+            forward(input) {
+                this.z = [];
+                this.a = [input];
+                let current = input;
+                for (let i = 0; i < this.weights.length; i++) {
+                    const W = this.weights[i];
+                    const b = this.biases[i];
+                    const nextRaw = new Array(W.length);
+                    for (let j = 0; j < W.length; j++) {
+                        let sum = b[j];
+                        for (let k = 0; k < W[j].length; k++) sum += W[j][k] * current[k];
+                        nextRaw[j] = sum;
+                    }
+                    this.z.push(nextRaw);
+                    const activated = new Array(nextRaw.length);
+                    if (i === this.weights.length - 1) {
+                        for (let j = 0; j < nextRaw.length; j++) activated[j] = nextRaw[j]; // линейный выход
+                    } else {
+                        for (let j = 0; j < nextRaw.length; j++) activated[j] = Math.max(0, nextRaw[j]); // ReLU
+                    }
+                    this.a.push(activated);
+                    current = activated;
+                }
+                return current;
+            }
+
+            // Обратный проход (MSE, градиентный спуск)
+            train(input, target, learningRate) {
+                const output = this.forward(input); // заполняет this.z, this.a
+                const L = this.weights.length;
+                // delta для выходного слоя (производная MSE * dA, dA=1 для линейного)
+                let delta = new Array(this.layers[L]).fill(0);
+                for (let i = 0; i < output.length; i++) {
+                    delta[i] = output[i] - target[i];   // dL/doutput
+                }
+
+                // Двигаемся от выходного слоя к первому скрытому
+                for (let l = L - 1; l >= 0; l--) {
+                    const W = this.weights[l];
+                    const a_prev = this.a[l];
+                    const z = this.z[l];
+
+                    // Для скрытых слоёв домножаем на производную ReLU
+                    if (l < L - 1) {
+                        for (let j = 0; j < delta.length; j++) {
+                            delta[j] *= (z[j] > 0 ? 1 : 0);
+                        }
+                    }
+
+                    // Обновление весов и смещений
+                    for (let j = 0; j < W.length; j++) {
+                        for (let k = 0; k < W[j].length; k++) {
+                            W[j][k] -= learningRate * delta[j] * a_prev[k];
+                        }
+                        this.biases[l][j] -= learningRate * delta[j];
+                    }
+
+                    // Если не первый слой, вычисляем delta для предыдущего
+                    if (l > 0) {
+                        const prev_delta = new Array(W[0].length).fill(0);
+                        for (let k = 0; k < W[0].length; k++) {
+                            let sum = 0;
+                            for (let j = 0; j < W.length; j++) {
+                                sum += W[j][k] * delta[j];
+                            }
+                            prev_delta[k] = sum;
+                        }
+                        delta = prev_delta;
+                    }
+                }
+            }
+        }
+
+        // ========== 2. DQN Агент с целевой сетью и затуханием ε ==========
+        class DQNAgent {
+            constructor(stateSize, actionSize, learningRate = 0.002, gamma = 0.99,
+                        epsilon = 0.5, epsilonMin = 0.02, epsilonDecay = 0.995) {
+                this.stateSize = stateSize;
+                this.actionSize = actionSize;
+                this.gamma = gamma;
+                this.epsilon = epsilon;
+                this.epsilonMin = epsilonMin;
+                this.epsilonDecay = epsilonDecay;
+                this.learningRate = learningRate;
+
+                this.model = new NeuralNetwork([stateSize, 128, 64, actionSize]);
+                this.targetModel = new NeuralNetwork([stateSize, 128, 64, actionSize]);
+                this.updateTargetModel();
+
+                this.memory = [];
+                this.batchSize = 64;
+                this.memoryCapacity = 5000;
+                this.stepsSinceTargetUpdate = 0;
+                this.targetUpdateFreq = 200;
+            }
+
+            updateTargetModel() {
+                for (let l = 0; l < this.model.weights.length; l++) {
+                    for (let j = 0; j < this.model.weights[l].length; j++) {
+                        for (let k = 0; k < this.model.weights[l][j].length; k++) {
+                            this.targetModel.weights[l][j][k] = this.model.weights[l][j][k];
+                        }
+                        this.targetModel.biases[l][j] = this.model.biases[l][j];
+                    }
+                }
+            }
+
+            act(state) {
+                if (Math.random() < this.epsilon) {
+                    return Math.floor(Math.random() * this.actionSize);
+                }
+                const q = this.model.forward(state);
+                let maxIdx = 0;
+                for (let i = 1; i < q.length; i++) if (q[i] > q[maxIdx]) maxIdx = i;
+                return maxIdx;
+            }
+
+            remember(state, action, reward, nextState, done) {
+                this.memory.push({ state, action, reward, nextState, done });
+                if (this.memory.length > this.memoryCapacity) this.memory.shift();
+            }
+
+            replay() {
+                if (this.memory.length < this.batchSize) return;
+
+                // Затухание epsilon
+                if (this.epsilon > this.epsilonMin) {
+                    this.epsilon *= this.epsilonDecay;
+                }
+
+                // Случайный мини-батч
+                const batch = [];
+                const indices = new Set();
+                while (indices.size < this.batchSize) {
+                    indices.add(Math.floor(Math.random() * this.memory.length));
+                }
+                for (let idx of indices) batch.push(this.memory[idx]);
+
+                // Для каждого опыта вычисляем цель с помощью target сети и выполняем шаг обучения
+                for (let exp of batch) {
+                    const { state, action, reward, nextState, done } = exp;
+                    const qNext = this.targetModel.forward(nextState);
+                    const targetQ = this.model.forward(state).slice();
+                    if (done) {
+                        targetQ[action] = reward;
+                    } else {
+                        targetQ[action] = reward + this.gamma * Math.max(...qNext);
+                    }
+                    this.model.train(state, targetQ, this.learningRate);
+                }
+
+                // Периодически обновляем целевую сеть
+                this.stepsSinceTargetUpdate += this.batchSize;
+                if (this.stepsSinceTargetUpdate >= this.targetUpdateFreq) {
+                    this.updateTargetModel();
+                    this.stepsSinceTargetUpdate = 0;
+                }
+            }
+        }
+
+        // ========== 3. Симуляция ==========
+        const { Engine, Render, Bodies, Composite, Body, Constraint, Query } = Matter;
+        const WIDTH = 800, HEIGHT = 500;
+        let simSpeed = 15;
+
+        const engine = Engine.create({ gravity: { y: 1, scale: 0.001 } });
+        const world = engine.world;
+
+        const container = document.getElementById('canvas-container');
+        const render = Render.create({
+            element: container,
+            engine: engine,
+            options: { width: WIDTH, height: HEIGHT, wireframes: false, background: '#111' }
+        });
+
+        const ground = Bodies.rectangle(WIDTH/2, HEIGHT-10, WIDTH, 20, { isStatic: true, render: { fillStyle: '#333' } });
+        const leftWall = Bodies.rectangle(10, HEIGHT/2, 20, HEIGHT, { isStatic: true });
+        const rightWall = Bodies.rectangle(WIDTH-10, HEIGHT/2, 20, HEIGHT, { isStatic: true });
+        const obstacle = Bodies.rectangle(400, 360, 40, 260, { isStatic: true, render: { fillStyle: '#d32f2f' } });
+
+        const drone = Bodies.rectangle(100, 430, 60, 15, { density: 0.005, frictionAir: 0.07, render: { fillStyle: '#00e676' } });
+        let cargo = Bodies.rectangle(700, 450, 25, 25, { density: 0.004, render: { fillStyle: '#ff9100' } });
+        const basePos = { x: 100, y: 450 };
+        const staticBodies = [ground, leftWall, rightWall, obstacle];
+
+        Composite.add(world, [ground, leftWall, rightWall, obstacle, drone, cargo]);
+
+        let isCargoAttached = false;
+        let cargoConstraint = null;
+        let episodes = 0;
+        let totalSteps = 0;
+
+        let windForceX = 0, windTime = 0;
+
+        const agent = new DQNAgent(10, 4, 0.002, 0.99, 0.5, 0.02, 0.995);
+
+        function getRadarDistance(angleOffset) {
+            const maxRayLength = 250;
+            const rayAngle = drone.angle + angleOffset;
+            const endPoint = {
+                x: drone.position.x + Math.sin(rayAngle) * maxRayLength,
+                y: drone.position.y - Math.cos(rayAngle) * maxRayLength
+            };
+            const collisions = Query.ray(staticBodies, drone.position, endPoint);
+            if (collisions.length > 0 && collisions[0].point) {
+                const hitPoint = collisions[0].point;
+                const dx = hitPoint.x - drone.position.x;
+                const dy = hitPoint.y - drone.position.y;
+                return Math.sqrt(dx*dx + dy*dy) / maxRayLength;
+            }
+            return 1.0;
+        }
+
+        function updateWind() {
+            windTime += 0.01;
+            windForceX = Math.sin(windTime) * 0.012 + Math.cos(windTime * 2.5) * 0.006;
+            if (windForceX > 0.02) windForceX = 0.02;
+            if (windForceX < -0.02) windForceX = -0.02;
+        }
+
+        function applyDronePhysics(action) {
+            const force = 0.052;
+            const angle = drone.angle;
+            const forceVector = { x: Math.sin(angle) * force, y: -Math.cos(angle) * force };
+            if (action === 1 || action === 3) {
+                const leftPoint = { x: drone.position.x - Math.cos(angle)*25, y: drone.position.y - Math.sin(angle)*25 };
+                Body.applyForce(drone, leftPoint, forceVector);
+            }
+            if (action === 2 || action === 3) {
+                const rightPoint = { x: drone.position.x + Math.cos(angle)*25, y: drone.position.y + Math.sin(angle)*25 };
+                Body.applyForce(drone, rightPoint, forceVector);
+            }
+            Body.applyForce(drone, drone.position, { x: windForceX, y: 0 });
+            if (isCargoAttached) {
+                Body.applyForce(cargo, cargo.position, { x: windForceX * 0.5, y: 0 });
+            }
+        }
+
+        function getState() {
+            const targetX = isCargoAttached ? basePos.x : cargo.position.x;
+            const targetY = isCargoAttached ? basePos.y : cargo.position.y;
+            const dx = targetX - drone.position.x;
+            const dy = targetY - drone.position.y;
+            const radarLeft = getRadarDistance(-Math.PI/4);
+            const radarRight = getRadarDistance(Math.PI/4);
+            return [
+                drone.position.x / WIDTH,
+                drone.position.y / HEIGHT,
+                drone.velocity.x / 10,
+                drone.velocity.y / 10,
+                drone.angle / Math.PI,
+                Math.tanh(drone.angularVelocity),
+                dx / WIDTH,
+                dy / HEIGHT,
+                radarLeft,
+                radarRight
+            ];
+        }
+
+        function simulationStep() {
+            totalSteps++;
+            updateWind();
+            const state = getState();
+            const action = agent.act(state);
+            applyDronePhysics(action);
+            Engine.update(engine, 1000/60);
+
+            const nextState = getState();
+            const targetX = isCargoAttached ? basePos.x : cargo.position.x;
+            const targetY = isCargoAttached ? basePos.y : cargo.position.y;
+            const dx = targetX - drone.position.x;
+            const dy = targetY - drone.position.y;
+            const distAfter = Math.sqrt(dx*dx + dy*dy);
+
+            // Расчёт награды
+            const prevDist = Math.sqrt(
+                Math.pow(targetX - (drone.position.x - drone.velocity.x*0.016), 2) +
+                Math.pow(targetY - (drone.position.y - drone.velocity.y*0.016), 2)
+            );
+            let reward = (prevDist - distAfter) * 12;
+
+            // Штраф за близость к препятствиям
+            if (nextState[8] < 0.25 || nextState[9] < 0.25) reward -= 0.5;
+            reward -= 0.02; // небольшой штраф за время
+
+            let done = false;
+
+            // Взятие груза
+            if (!isCargoAttached && distAfter < 45) {
+                isCargoAttached = true;
+                reward += 150;
+                cargoConstraint = Constraint.create({
+                    bodyA: drone, bodyB: cargo, length: 45,
+                    stiffness: 0.7, damping: 0.1,
+                    render: { strokeStyle: '#ff9100', lineWidth: 3 }
+                });
+                Composite.add(world, cargoConstraint);
+                document.getElementById('drone-status').innerText = "Возврат на базу";
+                document.getElementById('drone-status').style.color = "#00e676";
+            }
+
+            // Успешная доставка
+            if (isCargoAttached && distAfter < 55 && drone.position.x < 250) {
+                reward += 500;
+                done = true;
+            }
+
+            // Опасные состояния
+            const isUpsideDown = Math.abs(drone.angle) > Math.PI/1.6;
+            const hitObstacle = Query.collides(drone, staticBodies).length > 0;
+            if (hitObstacle || drone.position.y < 15 || drone.position.y > HEIGHT) {
+                reward = -150;
+                done = true;
+            } else if (isUpsideDown && drone.angularVelocity * drone.angle > 0.1) {
+                // Мягкий штраф за переворот, но эпизод не завершаем сразу
+                reward -= 1.0;
+            }
+
+            agent.remember(state, action, reward, nextState, done);
+            agent.replay();
+
+            if (done) {
+                resetScene();
+            }
+
+            // Обновление интерфейса
+            if (totalSteps % 10 === 0) {
+                document.getElementById('steps-count').innerText = totalSteps;
+                document.getElementById('reward-val').innerText = reward.toFixed(2);
+                document.getElementById('epsilon-val').innerText = agent.epsilon.toFixed(3);
+                const windDir = windForceX > 0 ? "→ Справа" : "← Слева";
+                const windPower = Math.abs(windForceX * 1000).toFixed(1);
+                document.getElementById('wind-text').innerHTML = `${windDir} (${windPower} м/с)`;
+                document.getElementById('wind-text').style.color = windForceX > 0 ? "#00bcd4" : "#ff5722";
+            }
+        }
+
+        function resetScene() {
+            episodes++;
+            totalSteps = 0;
+            document.getElementById('episodes-count').innerText = episodes;
+            document.getElementById('steps-count').innerText = totalSteps;
+            if (cargoConstraint) {
+                Composite.remove(world, cargoConstraint);
+                cargoConstraint = null;
+            }
+            isCargoAttached = false;
+            document.getElementById('drone-status').innerText = "Поиск груза";
+            document.getElementById('drone-status').style.color = "#ff9800";
+
+            Body.setPosition(drone, { x: 100, y: 430 });
+            Body.setVelocity(drone, { x: 0, y: 0 });
+            Body.setAngle(drone, 0);
+            Body.setAngularVelocity(drone, 0);
+
+            Body.setPosition(cargo, { x: 700, y: 450 });
+            Body.setVelocity(cargo, { x: 0, y: 0 });
+            Body.setAngle(cargo, 0);
+            Body.setAngularVelocity(cargo, 0);
+        }
+
+        function gameLoop() {
+            for (let i = 0; i < simSpeed; i++) simulationStep();
+            Render.world(render);
+            requestAnimationFrame(gameLoop);
+        }
+
+        document.getElementById('speed-btn').addEventListener('click', () => {
+            simSpeed = simSpeed === 1 ? 15 : 1;
+            document.getElementById('speed-btn').innerText = simSpeed === 15 ? "Скорость: Турбо (15х)" : "Скорость: Обычная (1х)";
+            document.getElementById('speed-btn').style.background = simSpeed === 15 ? "#e91e63" : "#4caf50";
+        });
+
+        gameLoop();
+    </script>
+</body>
+</html>
