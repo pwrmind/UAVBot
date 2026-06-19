@@ -2,33 +2,34 @@
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <title>БПЛА: DQN + физика + ветер (исправленная нейросеть + целевая сеть)</title>
+    <title>БПЛА: DQN + физика + ветер (исправленная нейросеть + управление ветром)</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
     <style>
         body { font-family: sans-serif; background: #1a1a1a; color: #fff; margin: 20px; }
         #canvas-container { border: 2px solid #444; float: left; position: relative; }
         #controls { float: left; margin-left: 20px; background: #2a2a2a; padding: 15px; border-radius: 8px; width: 300px; }
-        .btn { background: #e91e63; border: none; color: white; padding: 10px 20px; cursor: pointer; border-radius: 4px; font-weight: bold; width: 100%;}
-        .btn:hover { background: #c2185b; }
+        .btn { border: none; color: white; padding: 10px 20px; cursor: pointer; border-radius: 4px; font-weight: bold; width: 100%; margin-top: 8px; }
+        .btn:hover { opacity: 0.9; }
         .stat { margin: 10px 0; font-size: 14px; }
         #wind-hud { position: absolute; top: 15px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.6); padding: 5px 15px; border-radius: 15px; font-size: 14px; pointer-events: none; border: 1px solid #555; }
     </style>
 </head>
 <body>
-    <h2>БПЛА: DQN (исправленный backprop + target network)</h2>
+    <h2>БПЛА: DQN (исправленный backprop + target network + ветер вкл/выкл)</h2>
     <div id="canvas-container">
         <div id="wind-hud">Ветер: <span id="wind-text">0.00</span></div>
     </div>
     <div id="controls">
         <h3>Управление ИИ</h3>
-        <button class="btn" id="speed-btn">Скорость: Турбо (15х)</button>
+        <button class="btn" id="speed-btn" style="background:#e91e63;">Скорость: Турбо (15х)</button>
+        <button class="btn" id="wind-btn" style="background:#2196F3;">Ветер: Вкл</button>
         <div class="stat">Эпоха (Рестарты): <b id="episodes-count">0</b></div>
         <div class="stat">Текущий шаг: <b id="steps-count">0</b></div>
         <div class="stat">Статус: <b id="drone-status" style="color:#ff9800">Поиск груза</b></div>
         <div class="stat">Награда: <b id="reward-val">0</b></div>
         <div class="stat">ε: <b id="epsilon-val">0.50</b></div>
         <hr style="border-color:#444">
-        <p style="font-size:12px;color:#aaa">Исправленный backprop, целевая сеть, затухающий epsilon.</p>
+        <p style="font-size:12px;color:#aaa">Исправленный backprop, целевая сеть, затухающий epsilon, отключение ветра.</p>
     </div>
 
     <script>
@@ -51,7 +52,6 @@
                 }
             }
 
-            // Прямой проход с сохранением z (до активации) и a (после)
             forward(input) {
                 this.z = [];
                 this.a = [input];
@@ -68,9 +68,9 @@
                     this.z.push(nextRaw);
                     const activated = new Array(nextRaw.length);
                     if (i === this.weights.length - 1) {
-                        for (let j = 0; j < nextRaw.length; j++) activated[j] = nextRaw[j]; // линейный выход
+                        for (let j = 0; j < nextRaw.length; j++) activated[j] = nextRaw[j];
                     } else {
-                        for (let j = 0; j < nextRaw.length; j++) activated[j] = Math.max(0, nextRaw[j]); // ReLU
+                        for (let j = 0; j < nextRaw.length; j++) activated[j] = Math.max(0, nextRaw[j]);
                     }
                     this.a.push(activated);
                     current = activated;
@@ -78,30 +78,25 @@
                 return current;
             }
 
-            // Обратный проход (MSE, градиентный спуск)
             train(input, target, learningRate) {
-                const output = this.forward(input); // заполняет this.z, this.a
+                const output = this.forward(input);
                 const L = this.weights.length;
-                // delta для выходного слоя (производная MSE * dA, dA=1 для линейного)
                 let delta = new Array(this.layers[L]).fill(0);
                 for (let i = 0; i < output.length; i++) {
-                    delta[i] = output[i] - target[i];   // dL/doutput
+                    delta[i] = output[i] - target[i];
                 }
 
-                // Двигаемся от выходного слоя к первому скрытому
                 for (let l = L - 1; l >= 0; l--) {
                     const W = this.weights[l];
                     const a_prev = this.a[l];
                     const z = this.z[l];
 
-                    // Для скрытых слоёв домножаем на производную ReLU
                     if (l < L - 1) {
                         for (let j = 0; j < delta.length; j++) {
                             delta[j] *= (z[j] > 0 ? 1 : 0);
                         }
                     }
 
-                    // Обновление весов и смещений
                     for (let j = 0; j < W.length; j++) {
                         for (let k = 0; k < W[j].length; k++) {
                             W[j][k] -= learningRate * delta[j] * a_prev[k];
@@ -109,7 +104,6 @@
                         this.biases[l][j] -= learningRate * delta[j];
                     }
 
-                    // Если не первый слой, вычисляем delta для предыдущего
                     if (l > 0) {
                         const prev_delta = new Array(W[0].length).fill(0);
                         for (let k = 0; k < W[0].length; k++) {
@@ -177,12 +171,10 @@
             replay() {
                 if (this.memory.length < this.batchSize) return;
 
-                // Затухание epsilon
                 if (this.epsilon > this.epsilonMin) {
                     this.epsilon *= this.epsilonDecay;
                 }
 
-                // Случайный мини-батч
                 const batch = [];
                 const indices = new Set();
                 while (indices.size < this.batchSize) {
@@ -190,7 +182,6 @@
                 }
                 for (let idx of indices) batch.push(this.memory[idx]);
 
-                // Для каждого опыта вычисляем цель с помощью target сети и выполняем шаг обучения
                 for (let exp of batch) {
                     const { state, action, reward, nextState, done } = exp;
                     const qNext = this.targetModel.forward(nextState);
@@ -203,7 +194,6 @@
                     this.model.train(state, targetQ, this.learningRate);
                 }
 
-                // Периодически обновляем целевую сеть
                 this.stepsSinceTargetUpdate += this.batchSize;
                 if (this.stepsSinceTargetUpdate >= this.targetUpdateFreq) {
                     this.updateTargetModel();
@@ -216,6 +206,7 @@
         const { Engine, Render, Bodies, Composite, Body, Constraint, Query } = Matter;
         const WIDTH = 800, HEIGHT = 500;
         let simSpeed = 15;
+        let windEnabled = true;   // флаг включения ветра
 
         const engine = Engine.create({ gravity: { y: 1, scale: 0.001 } });
         const world = engine.world;
@@ -266,6 +257,10 @@
         }
 
         function updateWind() {
+            if (!windEnabled) {
+                windForceX = 0;
+                return;
+            }
             windTime += 0.01;
             windForceX = Math.sin(windTime) * 0.012 + Math.cos(windTime * 2.5) * 0.006;
             if (windForceX > 0.02) windForceX = 0.02;
@@ -326,20 +321,17 @@
             const dy = targetY - drone.position.y;
             const distAfter = Math.sqrt(dx*dx + dy*dy);
 
-            // Расчёт награды
             const prevDist = Math.sqrt(
                 Math.pow(targetX - (drone.position.x - drone.velocity.x*0.016), 2) +
                 Math.pow(targetY - (drone.position.y - drone.velocity.y*0.016), 2)
             );
             let reward = (prevDist - distAfter) * 12;
 
-            // Штраф за близость к препятствиям
             if (nextState[8] < 0.25 || nextState[9] < 0.25) reward -= 0.5;
-            reward -= 0.02; // небольшой штраф за время
+            reward -= 0.02;
 
             let done = false;
 
-            // Взятие груза
             if (!isCargoAttached && distAfter < 45) {
                 isCargoAttached = true;
                 reward += 150;
@@ -353,20 +345,17 @@
                 document.getElementById('drone-status').style.color = "#00e676";
             }
 
-            // Успешная доставка
             if (isCargoAttached && distAfter < 55 && drone.position.x < 250) {
                 reward += 500;
                 done = true;
             }
 
-            // Опасные состояния
             const isUpsideDown = Math.abs(drone.angle) > Math.PI/1.6;
             const hitObstacle = Query.collides(drone, staticBodies).length > 0;
             if (hitObstacle || drone.position.y < 15 || drone.position.y > HEIGHT) {
                 reward = -150;
                 done = true;
             } else if (isUpsideDown && drone.angularVelocity * drone.angle > 0.1) {
-                // Мягкий штраф за переворот, но эпизод не завершаем сразу
                 reward -= 1.0;
             }
 
@@ -377,15 +366,20 @@
                 resetScene();
             }
 
-            // Обновление интерфейса
             if (totalSteps % 10 === 0) {
                 document.getElementById('steps-count').innerText = totalSteps;
                 document.getElementById('reward-val').innerText = reward.toFixed(2);
                 document.getElementById('epsilon-val').innerText = agent.epsilon.toFixed(3);
-                const windDir = windForceX > 0 ? "→ Справа" : "← Слева";
-                const windPower = Math.abs(windForceX * 1000).toFixed(1);
-                document.getElementById('wind-text').innerHTML = `${windDir} (${windPower} м/с)`;
-                document.getElementById('wind-text').style.color = windForceX > 0 ? "#00bcd4" : "#ff5722";
+                const windSpan = document.getElementById('wind-text');
+                if (!windEnabled) {
+                    windSpan.innerHTML = "Выкл";
+                    windSpan.style.color = "#aaa";
+                } else {
+                    const windDir = windForceX > 0 ? "→ Справа" : "← Слева";
+                    const windPower = Math.abs(windForceX * 1000).toFixed(1);
+                    windSpan.innerHTML = `${windDir} (${windPower} м/с)`;
+                    windSpan.style.color = windForceX > 0 ? "#00bcd4" : "#ff5722";
+                }
             }
         }
 
@@ -423,6 +417,19 @@
             simSpeed = simSpeed === 1 ? 15 : 1;
             document.getElementById('speed-btn').innerText = simSpeed === 15 ? "Скорость: Турбо (15х)" : "Скорость: Обычная (1х)";
             document.getElementById('speed-btn').style.background = simSpeed === 15 ? "#e91e63" : "#4caf50";
+        });
+
+        document.getElementById('wind-btn').addEventListener('click', () => {
+            windEnabled = !windEnabled;
+            const btn = document.getElementById('wind-btn');
+            if (windEnabled) {
+                btn.innerText = 'Ветер: Вкл';
+                btn.style.background = '#2196F3';
+            } else {
+                btn.innerText = 'Ветер: Выкл';
+                btn.style.background = '#607D8B';
+                windForceX = 0; // мгновенно убираем ветер
+            }
         });
 
         gameLoop();
