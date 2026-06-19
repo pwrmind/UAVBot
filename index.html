@@ -2,7 +2,7 @@
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <title>БПЛА: DQN (стабильная физика + ветер вкл/выкл) – исправленная версия</title>
+    <title>БПЛА: DQN (стабильная физика + ветер вкл/выкл) – финальная версия</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js">
     </script>
     <style>
@@ -12,13 +12,11 @@
             color: #fff;
             margin: 20px;
         }
-
         #canvas-container {
             border: 2px solid #444;
             float: left;
             position: relative;
         }
-
         #controls {
             float: left;
             margin-left: 20px;
@@ -27,7 +25,6 @@
             border-radius: 8px;
             width: 300px;
         }
-
         .btn {
             border: none;
             color: white;
@@ -38,16 +35,13 @@
             width: 100%;
             margin-top: 8px;
         }
-
         .btn:hover {
             opacity: 0.9;
         }
-
         .stat {
             margin: 10px 0;
             font-size: 14px;
         }
-
         #wind-hud {
             position: absolute;
             top: 15px;
@@ -63,7 +57,7 @@
     </style>
 </head>
 <body>
-<h2>БПЛА: DQN (стабильная физика, скорость x1/x4) – исправленная версия</h2>
+<h2>БПЛА: DQN (стабильная физика, скорость x1/x4) – финальная версия</h2>
 <div id="canvas-container">
     <div id="wind-hud">Ветер: <span id="wind-text">0.00</span></div>
 </div>
@@ -77,8 +71,7 @@
     <div class="stat">Награда: <b id="reward-val">0</b></div>
     <div class="stat">ε: <b id="epsilon-val">0.50</b></div>
     <hr style="border-color:#444">
-    <p style="font-size:12px;color:#aaa">Исправления: земля не убивает, ε-затухание раз в эпизод, угловое демпфирование, batch-градиенты,
-        радар не видит пол.</p>
+    <p style="font-size:12px;color:#aaa">Земля безопасна, ε-затухание раз в эпизод, batch-градиенты, угловое демпфирование 0.3, две цветные половины дрона.</p>
 </div>
 
 <script>
@@ -99,7 +92,6 @@
                 this.weights.push(w);
                 this.biases.push(new Array(layers[i]).fill(0));
             }
-            // для хранения промежуточных значений при forward
             this.z = [];
             this.a = [];
         }
@@ -120,10 +112,8 @@
                 this.z.push(nextRaw);
                 const activated = new Array(nextRaw.length);
                 if (i === this.weights.length - 1) {
-                    // линейный выход
                     for (let j = 0; j < nextRaw.length; j++) activated[j] = nextRaw[j];
                 } else {
-                    // ReLU
                     for (let j = 0; j < nextRaw.length; j++) activated[j] = Math.max(0, nextRaw[j]);
                 }
                 this.a.push(activated);
@@ -135,40 +125,31 @@
         // Обучение на мини‑батче (стабильный градиент)
         trainBatch(batch, learningRate) {
             const L = this.weights.length;
-            // Инициализируем аккумуляторы градиентов нулями
             const gradW = this.weights.map(W => W.map(row => row.map(() => 0)));
             const gradB = this.biases.map(b => b.map(() => 0));
 
             for (const sample of batch) {
                 const { input, target } = sample;
-                // прямой проход
                 const output = this.forward(input);
-                // ошибка выходного слоя
                 let delta = new Array(this.layers[L]).fill(0);
                 for (let i = 0; i < output.length; i++) {
                     delta[i] = output[i] - target[i];
                 }
-                // обратное распространение и накопление градиентов
                 for (let l = L - 1; l >= 0; l--) {
                     const W = this.weights[l];
                     const aPrev = this.a[l];
                     const z = this.z[l];
-
-                    // производная ReLU для скрытых слоёв
                     if (l < L - 1) {
                         for (let j = 0; j < delta.length; j++) {
                             delta[j] *= (z[j] > 0 ? 1 : 0);
                         }
                     }
-
                     for (let j = 0; j < W.length; j++) {
                         for (let k = 0; k < W[j].length; k++) {
                             gradW[l][j][k] += delta[j] * aPrev[k];
                         }
                         gradB[l][j] += delta[j];
                     }
-
-                    // переход к предыдущему слою
                     if (l > 0) {
                         const prevDelta = new Array(W[0].length).fill(0);
                         for (let k = 0; k < W[0].length; k++) {
@@ -183,7 +164,6 @@
                 }
             }
 
-            // Усредняем и применяем градиенты
             const n = batch.length;
             for (let l = 0; l < L; l++) {
                 const W = this.weights[l];
@@ -250,7 +230,6 @@
         replay() {
             if (this.memory.length < this.batchSize) return;
 
-            // ε‑затухание теперь происходит только в конце эпизода (в resetScene)
             const batch = [];
             const indices = new Set();
             while (indices.size < this.batchSize) {
@@ -271,7 +250,6 @@
                 batchSamples.push({ input: state, target: targetQ });
             }
 
-            // Одно стабильное обновление по всему батчу
             this.model.trainBatch(batchSamples, this.learningRate);
 
             this.stepsSinceTargetUpdate += this.batchSize;
@@ -285,10 +263,9 @@
     // ========== 3. Симуляция ==========
     const { Engine, Render, Bodies, Composite, Body, Constraint, Query } = Matter;
     const WIDTH = 800, HEIGHT = 500;
-    let simSpeed = 4;           // макс. 4x (стабильно)
+    let simSpeed = 4;
     let windEnabled = true;
 
-    // Увеличена гравитация для более быстрой динамики
     const engine = Engine.create({ gravity: { y: 1, scale: 0.003 } });
     const world = engine.world;
 
@@ -305,14 +282,13 @@
     const rightWall = Bodies.rectangle(WIDTH - 10, HEIGHT / 2, 20, HEIGHT, { isStatic: true });
     const obstacle = Bodies.rectangle(400, 360, 40, 260, { isStatic: true, render: { fillStyle: '#d32f2f' } });
 
-    // Дрон
-const drone = Bodies.rectangle(100, 430, 60, 15, {
-    density: 0.008,
-    frictionAir: 0.1,
-    render: { fillStyle: '#00e676' }
-});
-// Устанавливаем угловое демпфирование (вместо несуществующего setAngularDamping)
-drone.angularDamping = 0.12;
+    // Дрон (увеличенное angularDamping для стабильности)
+    const drone = Bodies.rectangle(100, 430, 60, 15, {
+        density: 0.008,
+        frictionAir: 0.1,
+        render: { fillStyle: '#00e676', strokeStyle: '#000', lineWidth: 1 }
+    });
+    drone.angularDamping = 0.3;  // улучшенная устойчивость от переворотов
 
     // Груз
     let cargo = Bodies.rectangle(700, 450, 25, 25, {
@@ -321,12 +297,11 @@ drone.angularDamping = 0.12;
     });
     const basePos = { x: 100, y: 450 };
 
-    // Массивы для проверки столкновений
-    // Опасные тела (столкновение с ними = конец эпизода) – земля исключена!
+    // Опасные тела: стены и препятствие, земля НЕ входит
     const hazardousBodies = [leftWall, rightWall, obstacle];
-    // Все статические тела для физики (рендер и коллизии)
+    // Все статические тела для физики
     const staticBodies = [ground, leftWall, rightWall, obstacle];
-    // Тела, которые видит радар (только препятствие, земля не нужна)
+    // Тела для радара – только препятствие (земля не видна)
     const radarBodies = [obstacle];
 
     Composite.add(world, [ground, leftWall, rightWall, obstacle, drone, cargo]);
@@ -335,13 +310,41 @@ drone.angularDamping = 0.12;
     let cargoConstraint = null;
     let episodes = 0;
     let totalSteps = 0;
-    let safeSteps = 0;          // счётчик "безопасных" шагов в начале эпизода
+    let safeSteps = 0;
 
     let windForceX = 0, windTime = 0;
 
     const agent = new DQNAgent(10, 4, 0.002, 0.99, 0.5, 0.02, 0.995);
 
-    // Радар: расстояние до препятствия (нормированное)
+    // ---------- Кастомная отрисовка дрона (две половины) ----------
+    function drawDroneMarker(ctx, body) {
+        const w = 60;
+        const h = 15;
+        const halfH = h / 2;
+        const pos = body.position;
+        const angle = body.angle;
+
+        ctx.save();
+        ctx.translate(pos.x, pos.y);
+        ctx.rotate(angle);
+
+        // Верхняя половина (зелёная)
+        ctx.fillStyle = '#00e676';
+        ctx.fillRect(-w/2, -halfH, w, halfH);
+
+        // Нижняя половина (оранжевая)
+        ctx.fillStyle = '#ff9100';
+        ctx.fillRect(-w/2, 0, w, halfH);
+
+        // Обводка
+        ctx.strokeStyle = '#000';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(-w/2, -halfH, w, h);
+
+        ctx.restore();
+    }
+
+    // Радар: расстояние до препятствия
     function getRadarDistance(angleOffset) {
         const maxRayLength = 250;
         const rayAngle = drone.angle + angleOffset;
@@ -371,7 +374,7 @@ drone.angularDamping = 0.12;
     }
 
     function applyDronePhysics(action) {
-        const force = 0.045;   // чуть уменьшена сила для стабильности
+        const force = 0.045;
         const angle = drone.angle;
         const forceVector = { x: Math.sin(angle) * force, y: -Math.cos(angle) * force };
         if (action === 1 || action === 3) {
@@ -430,16 +433,14 @@ drone.angularDamping = 0.12;
         const dy = targetY - drone.position.y;
         const distAfter = Math.sqrt(dx * dx + dy * dy);
 
-        // Предыдущее расстояние (приблизительно)
         const prevDist = Math.sqrt(
             Math.pow(targetX - (drone.position.x - drone.velocity.x * 0.016), 2) +
             Math.pow(targetY - (drone.position.y - drone.velocity.y * 0.016), 2)
         );
         let reward = (prevDist - distAfter) * 12;
 
-        // Небольшой штраф за близость к препятствию (по радару)
         if (nextState[8] < 0.25 || nextState[9] < 0.25) reward -= 0.5;
-        reward -= 0.02; // временной штраф
+        reward -= 0.02;
 
         let done = false;
 
@@ -466,15 +467,19 @@ drone.angularDamping = 0.12;
             done = true;
         }
 
-        // Опасные ситуации: столкновение со стенами или препятствием, либо выход за вертикальные границы
+        // Опасные ситуации: столкновение со стенами или препятствием, выход за вертикальные границы
         const hitHazard = Query.collides(drone, hazardousBodies).length > 0;
         const outOfBounds = drone.position.y < 15 || drone.position.y > HEIGHT;
+        const isUpsideDown = Math.abs(drone.angle) > Math.PI / 2;   // угол > 90°
+        const isOnGround = Query.collides(drone, [ground]).length > 0;
 
-        if (hitHazard || outOfBounds) {
+        if (isUpsideDown && isOnGround) {
+            reward = -200;   // серьёзный штраф
+            done = true;
+        } else if (hitHazard || outOfBounds) {
             reward = -150;
             done = true;
         } else if (safeSteps < 20) {
-            // В первые 20 шагов нового эпизода не штрафуем сильно за перевороты
             safeSteps++;
         } else {
             const isUpsideDown = Math.abs(drone.angle) > Math.PI / 1.6;
@@ -509,9 +514,7 @@ drone.angularDamping = 0.12;
 
     function resetScene() {
         episodes++;
-        // ε-затухание раз в эпизод, а не на каждом шаге
         agent.epsilon = Math.max(agent.epsilonMin, agent.epsilon * agent.epsilonDecay);
-
         totalSteps = 0;
         safeSteps = 0;
         document.getElementById('episodes-count').innerText = episodes;
@@ -538,6 +541,11 @@ drone.angularDamping = 0.12;
     function gameLoop() {
         for (let i = 0; i < simSpeed; i++) simulationStep();
         Render.world(render);
+
+        // Рисуем цветную маркировку дрона (верх/низ)
+        const ctx = render.canvas.getContext('2d');
+        drawDroneMarker(ctx, drone);
+
         requestAnimationFrame(gameLoop);
     }
 
