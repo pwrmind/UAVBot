@@ -3,8 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>БПЛА: DQN + ПИД v3 (адаптивный, сенсоры, replay)</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.20.0/matter.min.js"></script>
+<title>БПЛА: DQN + ПИД v4 (кастомный рейкаст, адаптивный, сенсоры)</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
 <style>
     * { box-sizing: border-box; }
     html, body {
@@ -22,16 +22,12 @@
         box-shadow: 0 0 60px rgba(0, 230, 118, 0.12);
         border-radius: 6px;
     }
-
-    /* HUD ветра */
     #wind-hud {
         position: fixed; top: 18px; left: 50%; transform: translateX(-50%);
         background: rgba(0,0,0,0.75); padding: 6px 18px; border-radius: 20px;
         font-size: 14px; border: 1px solid #555; z-index: 50;
         pointer-events: none; backdrop-filter: blur(6px);
     }
-
-    /* Модальная панель управления */
     #controls {
         position: fixed; top: 20px; right: 20px; width: 380px;
         max-height: calc(100vh - 40px);
@@ -133,7 +129,6 @@
 <body>
 
 <div id="canvas-container"></div>
-
 <div id="wind-hud">Ветер: <span id="wind-text">0.00</span></div>
 
 <div id="controls">
@@ -174,6 +169,10 @@
         <div class="section">
             <div class="section-title">📡 Сенсоры (расстояние до препятствий)</div>
             <div id="sensors"></div>
+            <div class="hint" style="margin-top:8px; border-left-color:#00e676;">
+                Каждый луч возвращает <b>расстояние / RADAR_RANGE</b>.
+                1.00 — чисто в пределах 300 px, 0.00 — препятствие вплотную.
+            </div>
         </div>
 
         <div class="section">
@@ -193,7 +192,7 @@
 
 <script>
 // ============================================================
-// 1. НЕЙРОСЕТЬ (Adam, Huber, gradient clipping)
+// 1. НЕЙРОСЕТЬ
 // ============================================================
 class NeuralNetwork {
     constructor(layers) {
@@ -242,7 +241,6 @@ class NeuralNetwork {
         return current;
     }
 
-    // Возвращает средний Huber loss по батчу
     trainBatch(batch, learningRate) {
         const L = this.weights.length;
         const gradW = this.weights.map(W => W.map(row => row.map(() => 0)));
@@ -317,7 +315,7 @@ class NeuralNetwork {
 // ============================================================
 // 2. DQN-АГЕНТ
 // ============================================================
-const MODEL_VERSION = 3;
+const MODEL_VERSION = 4;
 
 class DQNAgent {
     constructor(stateSize, actionSize, lr = 0.0005) {
@@ -336,7 +334,7 @@ class DQNAgent {
         this.memory = [];
         this.batchSize = 64;
         this.memoryCapacity = 10000;
-        this.warmupSize = 1000;          // пока не наберём — не обучаемся
+        this.warmupSize = 1000;
         this.targetUpdateFreq = 500;
         this.gradientSteps = 0;
 
@@ -375,7 +373,6 @@ class DQNAgent {
 
     isWarmup() { return this.memory.length < this.warmupSize; }
 
-    // Один шаг обучения. Возвращает loss или null, если обучение не идёт.
     replay() {
         if (this.isWarmup()) return null;
 
@@ -386,7 +383,6 @@ class DQNAgent {
         const samples = [];
         let qSum = 0;
         for (const { state, action, reward, nextState, done } of batch) {
-            // Double DQN
             const qOnline = this.model.forward(nextState);
             let bestA = 0;
             for (let i = 1; i < qOnline.length; i++) if (qOnline[i] > qOnline[bestA]) bestA = i;
@@ -468,7 +464,6 @@ const render = Render.create({
     options: { width: WIDTH, height: HEIGHT, wireframes: false, background: '#0d0d0d' }
 });
 
-// --- Адаптивный размер canvas (CSS-масштабирование, сохраняя 3:2) ---
 function fitCanvas() {
     const aspect = WIDTH / HEIGHT;
     const winW = window.innerWidth, winH = window.innerHeight;
@@ -487,8 +482,6 @@ const leftWall  = Bodies.rectangle(10, HEIGHT/2, 20, HEIGHT,
     { isStatic: true, render: { fillStyle: '#3a3a3a' } });
 const rightWall = Bodies.rectangle(WIDTH - 10, HEIGHT/2, 20, HEIGHT,
     { isStatic: true, render: { fillStyle: '#3a3a3a' } });
-
-// Центральная колонна: снизу вверх, дрон должен перелететь её сверху
 const obstacle = Bodies.rectangle(600, 550, 60, 460,
     { isStatic: true, render: { fillStyle: '#c62828' } });
 
@@ -508,10 +501,10 @@ const cargo = Bodies.rectangle(1050, 755, 28, 28, {
 });
 
 const basePos = { x: 150, y: 700 };
-
 const hazardousBodies = [leftWall, rightWall, obstacle];
-// Радар видит всё, кроме земли (чтобы не зашкаливал при взлёте)
-const radarBodies = [obstacle, leftWall, rightWall];
+
+// Земля включена в цели радара — нижние лучи теперь показывают высоту
+const radarBodies = [obstacle, leftWall, rightWall, ground];
 
 Composite.add(world, [ground, leftWall, rightWall, obstacle, drone, cargo]);
 
@@ -524,14 +517,12 @@ let episodeReward = 0;
 let lastDistance = 0;
 const MAX_STEPS = 2500;
 
-// --- ПИД-цели ---
 let targetAngle = 0.0;
 let targetThrust = 0.5;
 const MAX_INTEGRAL = 1.0;
 
 let windForceX = 0, windTime = 0;
 
-// --- Действия ---
 const ACTION_HOLD = 0, ACTION_LEVEL = 1,
       ACTION_LEFT_SMALL = 2, ACTION_LEFT_LARGE = 3,
       ACTION_RIGHT_SMALL = 4, ACTION_RIGHT_LARGE = 5,
@@ -541,17 +532,68 @@ const NUM_ACTIONS = 8;
 // --- Сенсоры ---
 const RADAR_ANGLES = [-135, -90, -45, 0, 45, 90, 135].map(d => d * Math.PI / 180);
 const NUM_RAYS = RADAR_ANGLES.length;
-const RADAR_RANGE = 300; // пикселей
+const RADAR_RANGE = 300;
 
-// --- Состояние: 8 базовых + 7 лучей + 3 управляющих + 1 флаг груза = 19 ---
+// Состояние: 8 базовых + 7 лучей + 3 ПИД/флаг = 19
 const STATE_SIZE = 19;
-
 const agent = new DQNAgent(STATE_SIZE, NUM_ACTIONS, 0.0005);
 
 let radarRays = [];
 
 // ============================================================
-// 4. ОТРИСОВКА
+// 4. КАСТОМНЫЙ РЕЙКАСТ (замена Query.ray)
+// ============================================================
+// Возвращает {t, point} пересечения отрезка (p1→p2) с отрезком (p3→p4)
+// или null, если пересечения нет.
+function segmentIntersect(p1, p2, p3, p4) {
+    const d1x = p2.x - p1.x, d1y = p2.y - p1.y;
+    const d2x = p4.x - p3.x, d2y = p4.y - p3.y;
+    const denom = d1x * d2y - d1y * d2x;
+    if (Math.abs(denom) < 1e-10) return null; // параллельны
+    const rx = p3.x - p1.x, ry = p3.y - p1.y;
+    const t = (rx * d2y - ry * d2x) / denom;
+    const u = (rx * d1y - ry * d1x) / denom;
+    if (t >= 0 && t <= 1 && u >= 0 && u <= 1) {
+        return { t, x: p1.x + t * d1x, y: p1.y + t * d1y };
+    }
+    return null;
+}
+
+// Луч от позиции дрона. Возвращает { dist, hit, point }.
+function castRay(angleOffset) {
+    const rayAngle = drone.angle + angleOffset;
+    const start = { x: drone.position.x, y: drone.position.y };
+    const end = {
+        x: start.x + Math.sin(rayAngle) * RADAR_RANGE,
+        y: start.y - Math.cos(rayAngle) * RADAR_RANGE
+    };
+    let bestT = 1.0;
+    let bestPoint = end;
+    let hit = false;
+
+    for (const body of radarBodies) {
+        const v = body.vertices;
+        for (let i = 0; i < v.length; i++) {
+            const p3 = v[i];
+            const p4 = v[(i + 1) % v.length];
+            const r = segmentIntersect(start, end, p3, p4);
+            if (r && r.t < bestT) {
+                bestT = r.t;
+                bestPoint = { x: r.x, y: r.y };
+                hit = true;
+            }
+        }
+    }
+    return { dist: bestT, hit, point: bestPoint };
+}
+
+function updateRadarViz() {
+    radarRays = [];
+    for (const a of RADAR_ANGLES) radarRays.push(castRay(a));
+}
+
+// ============================================================
+// 5. ОТРИСОВКА
 // ============================================================
 function drawDroneMarker(ctx, body, targetAng) {
     const w = 60, h = 15, halfH = h / 2;
@@ -563,7 +605,6 @@ function drawDroneMarker(ctx, body, targetAng) {
     ctx.strokeStyle = '#000'; ctx.lineWidth = 1;
     ctx.strokeRect(-w/2, -halfH, w, h);
     ctx.rotate(-body.angle);
-    // Индикатор целевого угла
     ctx.beginPath();
     ctx.moveTo(0, 0);
     const len = 22;
@@ -589,41 +630,17 @@ function drawRadar() {
         ctx.beginPath();
         ctx.moveTo(drone.position.x, drone.position.y);
         ctx.lineTo(ray.point.x, ray.point.y);
-        ctx.strokeStyle = ray.hit ? 'rgba(255, 82, 82, 0.55)' : 'rgba(0, 229, 255, 0.18)';
-        ctx.lineWidth = 1.2;
+        ctx.strokeStyle = ray.hit ? 'rgba(255, 82, 82, 0.7)' : 'rgba(0, 229, 255, 0.22)';
+        ctx.lineWidth = ray.hit ? 1.6 : 1.0;
         ctx.stroke();
         if (ray.hit) {
             ctx.beginPath();
-            ctx.arc(ray.point.x, ray.point.y, 3, 0, Math.PI * 2);
-            ctx.fillStyle = 'rgba(255, 82, 82, 0.9)';
+            ctx.arc(ray.point.x, ray.point.y, 3.5, 0, Math.PI * 2);
+            ctx.fillStyle = 'rgba(255, 82, 82, 0.95)';
             ctx.fill();
         }
     }
     ctx.restore();
-}
-
-// ============================================================
-// 5. СЕНСОРЫ
-// ============================================================
-function castRay(angleOffset) {
-    const rayAngle = drone.angle + angleOffset;
-    const end = {
-        x: drone.position.x + Math.sin(rayAngle) * RADAR_RANGE,
-        y: drone.position.y - Math.cos(rayAngle) * RADAR_RANGE
-    };
-    const cols = Query.ray(radarBodies, drone.position, end);
-    if (cols.length > 0 && cols[0].point) {
-        const dx = cols[0].point.x - drone.position.x;
-        const dy = cols[0].point.y - drone.position.y;
-        const dist = Math.sqrt(dx*dx + dy*dy) / RADAR_RANGE;
-        return { dist, hit: true, point: cols[0].point };
-    }
-    return { dist: 1.0, hit: false, point: end };
-}
-
-function updateRadarViz() {
-    radarRays = [];
-    for (const a of RADAR_ANGLES) radarRays.push(castRay(a));
 }
 
 // ============================================================
@@ -655,7 +672,6 @@ function applyDronePhysics(action) {
         drone.angleErrorIntegral = 0;
     }
 
-    // ПИД по углу. Коэффициенты откалиброваны под инерцию ~2295 и dt²-масштаб Matter.js.
     const dt = 1/60;
     const kP = 0.15, kI = 0.01, kD = 0.35;
     const error = targetAngle - drone.angle;
@@ -665,14 +681,12 @@ function applyDronePhysics(action) {
     const torque = kP * error + kI * drone.angleErrorIntegral - kD * drone.angularVelocity;
     drone.torque = torque;
 
-    // Тяга вдоль корпуса
     const thrust = targetThrust * 0.05;
     Body.applyForce(drone, drone.position, {
         x: Math.sin(drone.angle) * thrust,
         y: -Math.cos(drone.angle) * thrust
     });
 
-    // Ветер
     Body.applyForce(drone, drone.position, { x: windForceX, y: 0 });
     if (isCargoAttached)
         Body.applyForce(cargo, cargo.position, { x: windForceX * 0.5, y: 0 });
@@ -687,24 +701,23 @@ function getState() {
     const dx = tx - drone.position.x;
     const dy = ty - drone.position.y;
 
-    // 7 лучей как сенсоры расстояния
     const rays = [];
     for (const a of RADAR_ANGLES) rays.push(castRay(a).dist);
 
     return [
-        drone.position.x / WIDTH,               // 0
-        drone.position.y / HEIGHT,              // 1
-        Math.tanh(drone.velocity.x / 10),       // 2
-        Math.tanh(drone.velocity.y / 10),       // 3
-        drone.angle / Math.PI,                  // 4
-        Math.tanh(drone.angularVelocity),       // 5
-        dx / WIDTH,                             // 6
-        dy / HEIGHT,                            // 7
-        ...rays,                                // 8..14  (7 сенсоров)
-        targetAngle / Math.PI,                  // 15
-        targetThrust,                           // 16
-        drone.angleErrorIntegral / MAX_INTEGRAL,// 17
-        isCargoAttached ? 1 : 0                 // 18
+        drone.position.x / WIDTH,
+        drone.position.y / HEIGHT,
+        Math.tanh(drone.velocity.x / 10),
+        Math.tanh(drone.velocity.y / 10),
+        drone.angle / Math.PI,
+        Math.tanh(drone.angularVelocity),
+        dx / WIDTH,
+        dy / HEIGHT,
+        ...rays,                                 // 8..14
+        targetAngle / Math.PI,                   // 15
+        targetThrust,                            // 16
+        drone.angleErrorIntegral / MAX_INTEGRAL, // 17
+        isCargoAttached ? 1 : 0                  // 18
     ];
 }
 
@@ -735,17 +748,17 @@ function simulationStep() {
     let reward = (lastDistance - distAfter) * 0.3;
     lastDistance = distAfter;
 
-    // Штраф за опасную близость к препятствиям (по 7 сенсорам)
+    // Штраф по минимуму из сенсоров (только по "передним" лучам, чтобы
+    // не наказывать за близость к полу на взлёте)
     let minRay = 1.0;
     for (let i = 8; i < 8 + NUM_RAYS; i++) if (nextState[i] < minRay) minRay = nextState[i];
-    if (minRay < 0.15) reward -= 1.0;
-    else if (minRay < 0.30) reward -= 0.3;
+    if (minRay < 0.10) reward -= 1.0;
+    else if (minRay < 0.20) reward -= 0.3;
 
-    reward -= 0.03; // штраф за время
+    reward -= 0.03;
 
     let done = false;
 
-    // Захват груза
     if (!isCargoAttached && distAfter < 45) {
         isCargoAttached = true;
         reward += 100;
@@ -760,13 +773,11 @@ function simulationStep() {
         lastDistance = currentDistance();
     }
 
-    // Доставка
     if (isCargoAttached && distAfter < 60 && drone.position.x < 260) {
         reward += 300;
         done = true;
     }
 
-    // Опасные ситуации
     const hitHazard = Query.collides(drone, hazardousBodies).length > 0;
     const outOfBounds = drone.position.y < 15;
     const isUpsideDown = Math.abs(drone.angle) > Math.PI / 2;
@@ -821,7 +832,7 @@ function resetScene() {
 }
 
 // ============================================================
-// 9. UI: сенсоры, обучение
+// 9. UI
 // ============================================================
 function buildSensorUI() {
     const root = document.getElementById('sensors');
@@ -867,13 +878,11 @@ function updateStatsUI(state) {
     else if (targetAngle > 0.02) { dirEl.innerText = '→'; dirEl.style.color = '#ff5722'; }
     else { dirEl.innerText = '•'; dirEl.style.color = '#aaa'; }
 
-    // Память
     const mem = agent.memory.length;
     const cap = agent.memoryCapacity;
     document.getElementById('memory-text').innerText = `${mem} / ${cap}`;
     document.getElementById('memory-bar').style.width = (mem / cap * 100).toFixed(1) + '%';
 
-    // Фаза
     const phaseEl = document.getElementById('phase-val');
     if (agent.isWarmup()) {
         phaseEl.className = 'badge warmup';
@@ -883,12 +892,10 @@ function updateStatsUI(state) {
         phaseEl.innerText = 'Обучение';
     }
 
-    // Loss и Q
     const avg = agent.avgLoss();
     document.getElementById('loss-val').innerText = avg != null ? avg.toFixed(4) : '—';
     document.getElementById('q-val').innerText = agent.lastAvgQ.toFixed(2);
 
-    // Ветер
     const windSpan = document.getElementById('wind-text');
     if (!windEnabled) {
         windSpan.innerHTML = "Выкл"; windSpan.style.color = "#aaa";
@@ -913,17 +920,15 @@ function gameLoop() {
     drawDroneMarker(render.canvas.getContext('2d'), drone, targetAngle);
 
     if (totalSteps % 5 === 0 || totalSteps < 5) {
-        const s = getState();
-        updateStatsUI(s);
+        updateStatsUI(getState());
     }
 
     requestAnimationFrame(gameLoop);
 }
 
 // ============================================================
-// 11. ОБРАБОТЧИКИ UI
+// 11. UI-ОБРАБОТЧИКИ
 // ============================================================
-// Сворачивание / разворачивание панели
 document.getElementById('controls-header').addEventListener('click', () => {
     const c = document.getElementById('controls');
     c.classList.toggle('collapsed');
@@ -948,13 +953,13 @@ document.getElementById('wind-btn').addEventListener('click', () => {
 document.getElementById('save-btn').addEventListener('click', () => {
     try {
         const data = agent.getWeightsData();
-        localStorage.setItem('drone_dqn_model_v3', JSON.stringify(data));
+        localStorage.setItem('drone_dqn_model_v4', JSON.stringify(data));
         alert('Модель сохранена в localStorage.');
     } catch (e) { alert('Ошибка сохранения: ' + e.message); }
 });
 
 document.getElementById('load-btn').addEventListener('click', () => {
-    const json = localStorage.getItem('drone_dqn_model_v3');
+    const json = localStorage.getItem('drone_dqn_model_v4');
     if (!json) { alert('Сохранённая модель не найдена.'); return; }
     try {
         agent.setWeightsData(JSON.parse(json));
