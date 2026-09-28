@@ -2,9 +2,8 @@
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <title>БПЛА: улучшенный DQN + ПИД‑стабилизатор</title>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js">
-    </script>
+    <title>БПЛА: улучшенный DQN + ПИД‑стабилизатор v2</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
     <style>
         body {
             font-family: sans-serif;
@@ -63,10 +62,11 @@
             width: auto;
             margin: 4px 0;
         }
+        .note { font-size: 12px; color: #aaa; margin-top: 8px; }
     </style>
 </head>
 <body>
-<h2>БПЛА: улучшенный DQN + ПИД‑стабилизатор (8 действий, Double DQN, Adam)</h2>
+<h2>БПЛА: улучшенный DQN + ПИД‑стабилизатор (14 входов, Double DQN, Huber loss)</h2>
 <div id="canvas-container">
     <div id="wind-hud">Ветер: <span id="wind-text">0.00</span></div>
 </div>
@@ -77,29 +77,32 @@
     <div class="stat">Эпизод: <b id="episodes-count">0</b></div>
     <div class="stat">Шаг: <b id="steps-count">0</b></div>
     <div class="stat">Статус: <b id="drone-status" style="color:#ff9800">Поиск груза</b></div>
-    <div class="stat">Награда: <b id="reward-val">0</b></div>
-    <div class="stat">ε: <b id="epsilon-val">0.50</b></div>
+    <div class="stat">Награда (эп.): <b id="reward-val">0</b></div>
+    <div class="stat">ε: <b id="epsilon-val">1.00</b></div>
     <div class="stat">Угол цели: <b id="target-angle-val">0.00</b> <span class="phase-indicator" id="angle-dir"></span></div>
     <div class="stat">Тяга: <b id="target-thrust-val">0.50</b></div>
+    <div class="stat">Память: <b id="memory-val">0</b></div>
     <hr style="border-color:#444">
     <button class="btn small-btn" id="save-btn" style="background:#607D8B;">Сохранить модель</button>
     <button class="btn small-btn" id="load-btn" style="background:#455A64;">Загрузить модель</button>
-    <p style="font-size:12px;color:#aaa">Модель сохраняется в localStorage. Кнопки «Сохранить/Загрузить» позволяют продолжить обучение.</p>
+    <button class="btn small-btn" id="reset-btn" style="background:#b71c1c;">Сбросить агента</button>
+    <p class="note">Модель сохраняется в localStorage (веса + Adam + ε). Буфер памяти при загрузке не сохраняется.</p>
 </div>
 
 <script>
-    // ========== 1. Нейросеть с Adam ==========
+    // ============================================================
+    // 1. Нейросеть с Adam, Huber loss, gradient clipping
+    // ============================================================
     class NeuralNetwork {
         constructor(layers) {
             this.layers = layers;
             this.weights = [];
             this.biases = [];
-            // Параметры Adam
             this.mWeights = [];
             this.vWeights = [];
             this.mBiases = [];
             this.vBiases = [];
-            this.t = 0; // счётчик шагов обучения
+            this.t = 0;
             for (let i = 1; i < layers.length; i++) {
                 const w = new Array(layers[i]);
                 const mW = new Array(layers[i]);
@@ -109,6 +112,7 @@
                     mW[j] = new Array(layers[i-1]).fill(0);
                     vW[j] = new Array(layers[i-1]).fill(0);
                     for (let k = 0; k < layers[i-1]; k++) {
+                        // He-инициализация для ReLU
                         w[j][k] = (Math.random()*2 - 1) * Math.sqrt(2 / layers[i-1]);
                     }
                 }
@@ -131,7 +135,8 @@
                 const nextRaw = new Array(W.length);
                 for (let j = 0; j < W.length; j++) {
                     let sum = b[j];
-                    for (let k = 0; k < W[j].length; k++) sum += W[j][k] * current[k];
+                    const Wj = W[j];
+                    for (let k = 0; k < Wj.length; k++) sum += Wj[k] * current[k];
                     nextRaw[j] = sum;
                 }
                 this.z.push(nextRaw);
@@ -147,7 +152,6 @@
             return current;
         }
 
-        // Обучение батча с Adam
         trainBatch(batch, learningRate) {
             const L = this.weights.length;
             const gradW = this.weights.map(W => W.map(row => row.map(() => 0)));
@@ -157,7 +161,11 @@
                 const { input, target } = sample;
                 const output = this.forward(input);
                 let delta = new Array(this.layers[L]).fill(0);
-                for (let i = 0; i < output.length; i++) delta[i] = output[i] - target[i];
+                // Huber loss градиент: |x|<=1 → x, иначе sign(x)
+                for (let i = 0; i < output.length; i++) {
+                    const x = output[i] - target[i];
+                    delta[i] = Math.abs(x) <= 1.0 ? x : Math.sign(x);
+                }
 
                 for (let l = L-1; l >= 0; l--) {
                     const W = this.weights[l];
@@ -167,10 +175,13 @@
                         for (let j = 0; j < delta.length; j++) delta[j] *= (z[j] > 0 ? 1 : 0);
                     }
                     for (let j = 0; j < W.length; j++) {
-                        for (let k = 0; k < W[j].length; k++) {
-                            gradW[l][j][k] += delta[j] * aPrev[k];
+                        const gradWj = gradW[l][j];
+                        const Wj = W[j];
+                        const dj = delta[j];
+                        for (let k = 0; k < Wj.length; k++) {
+                            gradWj[k] += dj * aPrev[k];
                         }
-                        gradB[l][j] += delta[j];
+                        gradB[l][j] += dj;
                     }
                     if (l > 0) {
                         const prevDelta = new Array(W[0].length).fill(0);
@@ -187,32 +198,60 @@
             const n = batch.length;
             this.t++;
             const beta1 = 0.9, beta2 = 0.999, eps = 1e-8;
-            const lr = learningRate * Math.sqrt(1 - Math.pow(beta2, this.t)) / (1 - Math.pow(beta1, this.t));
+            const biasCorr1 = 1 - Math.pow(beta1, this.t);
+            const biasCorr2 = 1 - Math.pow(beta2, this.t);
+            const lr = learningRate * Math.sqrt(biasCorr2) / biasCorr1;
+
+            // Gradient clipping: ограничение нормы градиента по каждому слою
+            const clipValue = 5.0;
 
             for (let l = 0; l < L; l++) {
                 const W = this.weights[l], b = this.biases[l];
                 const mW = this.mWeights[l], vW = this.vWeights[l];
                 const mB = this.mBiases[l], vB = this.vBiases[l];
+
+                // Считаем норму градиента слоя для клиппинга
+                let normSq = 0;
                 for (let j = 0; j < W.length; j++) {
                     for (let k = 0; k < W[j].length; k++) {
                         const g = gradW[l][j][k] / n;
-                        mW[j][k] = beta1 * mW[j][k] + (1 - beta1) * g;
-                        vW[j][k] = beta2 * vW[j][k] + (1 - beta2) * g * g;
-                        W[j][k] -= lr * mW[j][k] / (Math.sqrt(vW[j][k]) + eps);
+                        normSq += g * g;
                     }
                     const gb = gradB[l][j] / n;
+                    normSq += gb * gb;
+                }
+                const norm = Math.sqrt(normSq);
+                const scale = norm > clipValue ? clipValue / norm : 1.0;
+
+                for (let j = 0; j < W.length; j++) {
+                    for (let k = 0; k < W[j].length; k++) {
+                        const g = (gradW[l][j][k] / n) * scale;
+                        mW[j][k] = beta1 * mW[j][k] + (1 - beta1) * g;
+                        vW[j][k] = beta2 * vW[j][k] + (1 - beta2) * g * g;
+                        // Bias-corrected моменты
+                        const mHat = mW[j][k] / biasCorr1;
+                        const vHat = vW[j][k] / biasCorr2;
+                        W[j][k] -= lr * mHat / (Math.sqrt(vHat) + eps);
+                    }
+                    const gb = (gradB[l][j] / n) * scale;
                     mB[j] = beta1 * mB[j] + (1 - beta1) * gb;
                     vB[j] = beta2 * vB[j] + (1 - beta2) * gb * gb;
-                    b[j] -= lr * mB[j] / (Math.sqrt(vB[j]) + eps);
+                    const mBHat = mB[j] / biasCorr1;
+                    const vBHat = vB[j] / biasCorr2;
+                    b[j] -= lr * mBHat / (Math.sqrt(vBHat) + eps);
                 }
             }
         }
     }
 
-    // ========== 2. DQN Агент (8 действий, Double DQN) ==========
+    // ============================================================
+    // 2. DQN-агент (Double DQN)
+    // ============================================================
+    const MODEL_VERSION = 2;
+
     class DQNAgent {
-        constructor(stateSize, actionSize, lr=0.001, gamma=0.99,
-                    eps=0.5, epsMin=0.01, epsDecay=0.995) {
+        constructor(stateSize, actionSize, lr=0.0005, gamma=0.99,
+                    eps=1.0, epsMin=0.05, epsDecay=0.9997) {
             this.stateSize = stateSize;
             this.actionSize = actionSize;
             this.gamma = gamma;
@@ -227,9 +266,9 @@
 
             this.memory = [];
             this.batchSize = 64;
-            this.memoryCapacity = 10000;
+            this.memoryCapacity = 20000;
             this.stepsSinceTargetUpdate = 0;
-            this.targetUpdateFreq = 300;
+            this.targetUpdateFreq = 500;
         }
 
         updateTargetModel() {
@@ -241,6 +280,10 @@
                     this.targetModel.biases[l][j] = this.model.biases[l][j];
                 }
             }
+        }
+
+        decayEpsilon() {
+            this.epsilon = Math.max(this.epsilonMin, this.epsilon * this.epsilonDecay);
         }
 
         act(state) {
@@ -271,9 +314,12 @@
             const batchSamples = [];
             for (const exp of batch) {
                 const { state, action, reward, nextState, done } = exp;
-                // Double DQN: выбираем действие по основной сети, оцениваем по целевой
+                // Double DQN
                 const qNextOnline = this.model.forward(nextState);
-                const bestAction = qNextOnline.indexOf(Math.max(...qNextOnline));
+                let bestAction = 0;
+                for (let i = 1; i < qNextOnline.length; i++) {
+                    if (qNextOnline[i] > qNextOnline[bestAction]) bestAction = i;
+                }
                 const qNextTarget = this.targetModel.forward(nextState);
                 const qNextVal = done ? 0 : qNextTarget[bestAction];
                 const targetQ = this.model.forward(state).slice();
@@ -290,9 +336,11 @@
             }
         }
 
-        // Методы для сохранения/загрузки весов
         getWeightsData() {
             return {
+                version: MODEL_VERSION,
+                stateSize: this.stateSize,
+                actionSize: this.actionSize,
                 weights: this.model.weights,
                 biases: this.model.biases,
                 mWeights: this.model.mWeights,
@@ -305,6 +353,9 @@
         }
 
         setWeightsData(data) {
+            if (!data || data.stateSize !== this.stateSize || data.actionSize !== this.actionSize) {
+                throw new Error("Несовместимая модель (несовпадение размеров входа/выхода).");
+            }
             this.model.weights = data.weights;
             this.model.biases = data.biases;
             this.model.mWeights = data.mWeights;
@@ -312,12 +363,14 @@
             this.model.mBiases = data.mBiases;
             this.model.vBiases = data.vBiases;
             this.model.t = data.t || 0;
-            this.epsilon = data.epsilon || this.epsilon;
+            this.epsilon = data.epsilon != null ? data.epsilon : this.epsilon;
             this.updateTargetModel();
         }
     }
 
-    // ========== 3. Симуляция ==========
+    // ============================================================
+    // 3. Симуляция
+    // ============================================================
     const { Engine, Render, Bodies, Composite, Body, Constraint, Query } = Matter;
     const WIDTH = 800, HEIGHT = 500;
     let simSpeed = 4;
@@ -335,29 +388,29 @@
 
     // Статические тела
     const ground = Bodies.rectangle(WIDTH/2, HEIGHT-10, WIDTH, 20, { isStatic: true, render: { fillStyle: '#333' } });
-    const leftWall = Bodies.rectangle(10, HEIGHT/2, 20, HEIGHT, { isStatic: true });
-    const rightWall = Bodies.rectangle(WIDTH-10, HEIGHT/2, 20, HEIGHT, { isStatic: true });
+    const leftWall = Bodies.rectangle(10, HEIGHT/2, 20, HEIGHT, { isStatic: true, render: { fillStyle: '#444' } });
+    const rightWall = Bodies.rectangle(WIDTH-10, HEIGHT/2, 20, HEIGHT, { isStatic: true, render: { fillStyle: '#444' } });
     const obstacle = Bodies.rectangle(400, 360, 40, 260, { isStatic: true, render: { fillStyle: '#d32f2f' } });
 
-    // Дрон (сниженный angularDamping)
+    // Дрон: сниженный frictionAir, чтобы ПИД мог эффективно управлять углом.
+    // ВАЖНО: в Matter.js нет отдельного angularDamping — вращение тормозится только frictionAir.
     const drone = Bodies.rectangle(100, 430, 60, 15, {
         density: 0.008,
-        frictionAir: 0.08,
+        frictionAir: 0.015,
         render: { fillStyle: '#00e676', strokeStyle: '#000', lineWidth: 1 }
     });
-    drone.angularDamping = 0.08;
-    drone.angleErrorIntegral = 0; // интегральная ошибка ПИД
+    drone.angleErrorIntegral = 0;
 
     // Груз
     let cargo = Bodies.rectangle(700, 450, 25, 25, {
         density: 0.006,
+        frictionAir: 0.02,
         render: { fillStyle: '#ff9100' }
     });
-    const basePos = { x: 100, y: 450 };
+    const basePos = { x: 100, y: 430 };
 
     const hazardousBodies = [leftWall, rightWall, obstacle];
-    const staticBodies = [ground, leftWall, rightWall, obstacle];
-    const radarBodies = [obstacle];
+    const radarBodies = [obstacle, leftWall, rightWall];
 
     Composite.add(world, [ground, leftWall, rightWall, obstacle, drone, cargo]);
 
@@ -365,36 +418,40 @@
     let cargoConstraint = null;
     let episodes = 0;
     let totalSteps = 0;
-    let safeSteps = 0;
-    const MAX_STEPS = 3000; // тайм-аут эпизода
+    let episodeSteps = 0;
+    let episodeReward = 0;
+    let lastDistance = 0;
+    const MAX_STEPS = 2000;
 
     // ---------- Цели нижнего уровня (ПИД) ----------
     let targetAngle = 0.0;
     let targetThrust = 0.5;
 
+    // Интегратор ПИД ограничиваем
+    const MAX_INTEGRAL = 1.0;
+
     let windForceX = 0, windTime = 0;
 
-    // Действия: 0 – удержание цели, 1 – сброс (LEVEL), 2/3 – слабый/сильный влево, 4/5 – слабый/сильный вправо, 6 – тяга вверх, 7 – тяга вниз
+    // Действия
     const ACTION_HOLD = 0, ACTION_LEVEL = 1,
           ACTION_LEFT_SMALL = 2, ACTION_LEFT_LARGE = 3,
           ACTION_RIGHT_SMALL = 4, ACTION_RIGHT_LARGE = 5,
           ACTION_THRUST_UP = 6, ACTION_THRUST_DOWN = 7;
     const NUM_ACTIONS = 8;
 
-    // Агент: 13 входов (добавлен центральный луч радара)
-    const agent = new DQNAgent(13, NUM_ACTIONS, 0.001, 0.99, 0.5, 0.01, 0.995);
+    // Агент: 14 входов (добавлен angleErrorIntegral)
+    const STATE_SIZE = 14;
+    const agent = new DQNAgent(STATE_SIZE, NUM_ACTIONS, 0.0005, 0.99, 1.0, 0.05, 0.9997);
 
-    // Визуализация радара
-    let radarRays = []; // [{angle, endPoint, hit}]
+    let radarRays = [];
 
-    // Отрисовка дрона с индикатором цели
+    // ---------- Отрисовка ----------
     function drawDroneMarker(ctx, body, targetAng) {
         const w = 60, h = 15, halfH = h/2;
         const pos = body.position, angle = body.angle;
         ctx.save();
         ctx.translate(pos.x, pos.y);
         ctx.rotate(angle);
-        // Корпус
         ctx.fillStyle = '#00e676';
         ctx.fillRect(-w/2, -halfH, w, halfH);
         ctx.fillStyle = '#ff9100';
@@ -402,28 +459,30 @@
         ctx.strokeStyle = '#000';
         ctx.lineWidth = 1;
         ctx.strokeRect(-w/2, -halfH, w, h);
-        // Индикатор целевого угла (стрелка желаемого наклона)
-        ctx.rotate(-angle); // возвращаемся в мировую систему
+
+        ctx.rotate(-angle);
         ctx.beginPath();
         ctx.moveTo(0, 0);
-        const arrowLen = 18;
+        const arrowLen = 22;
         const tipX = Math.sin(targetAng) * arrowLen;
-        const tipY = -Math.cos(targetAng) * arrowLen; // вверх
+        const tipY = -Math.cos(targetAng) * arrowLen;
         ctx.lineTo(tipX, tipY);
         ctx.strokeStyle = '#ffeb3b';
         ctx.lineWidth = 2;
         ctx.stroke();
-        // Маленький треугольник на конце
         ctx.beginPath();
         ctx.moveTo(tipX, tipY);
-        ctx.lineTo(tipX - 4*Math.cos(targetAng) - 2*Math.sin(targetAng), tipY - 4*Math.sin(targetAng) + 2*Math.cos(targetAng));
-        ctx.lineTo(tipX - 4*Math.cos(targetAng) + 2*Math.sin(targetAng), tipY - 4*Math.sin(targetAng) - 2*Math.cos(targetAng));
+        ctx.lineTo(tipX - 4*Math.cos(targetAng) - 2*Math.sin(targetAng),
+                   tipY - 4*Math.sin(targetAng) + 2*Math.cos(targetAng));
+        ctx.lineTo(tipX - 4*Math.cos(targetAng) + 2*Math.sin(targetAng),
+                   tipY - 4*Math.sin(targetAng) - 2*Math.cos(targetAng));
         ctx.closePath();
         ctx.fillStyle = '#ffeb3b';
         ctx.fill();
         ctx.restore();
     }
 
+    // ---------- Радар ----------
     function getRadarDistance(angleOffset, saveRay = false) {
         const maxRayLength = 250;
         const rayAngle = drone.angle + angleOffset;
@@ -440,9 +499,7 @@
             dist = Math.sqrt(dx*dx + dy*dy) / maxRayLength;
             hit = true;
         }
-        if (saveRay) {
-            radarRays.push({ angle: rayAngle, endPoint: hitPoint, hit });
-        }
+        if (saveRay) radarRays.push({ angle: rayAngle, endPoint: hitPoint, hit });
         return dist;
     }
 
@@ -453,57 +510,48 @@
         windForceX = Math.max(-0.02, Math.min(0.02, windForceX));
     }
 
+    // ---------- ПИД-регулятор + физика дрона ----------
     function applyDronePhysics(action) {
-        // Сброс интегральной ошибки при резкой смене целевого угла
         const prevTargetAngle = targetAngle;
         // Верхний уровень: обновление целей
         switch(action) {
-            case ACTION_HOLD:
-                // Ничего не меняем
-                break;
+            case ACTION_HOLD: break;
             case ACTION_LEVEL:
                 targetAngle = 0.0;
                 targetThrust = 0.5;
                 drone.angleErrorIntegral = 0;
                 break;
-            case ACTION_LEFT_SMALL:
-                targetAngle = -0.15;
-                break;
-            case ACTION_LEFT_LARGE:
-                targetAngle = -0.35;
-                break;
-            case ACTION_RIGHT_SMALL:
-                targetAngle = 0.15;
-                break;
-            case ACTION_RIGHT_LARGE:
-                targetAngle = 0.35;
-                break;
+            case ACTION_LEFT_SMALL:  targetAngle = -0.15; break;
+            case ACTION_LEFT_LARGE:  targetAngle = -0.35; break;
+            case ACTION_RIGHT_SMALL: targetAngle =  0.15; break;
+            case ACTION_RIGHT_LARGE: targetAngle =  0.35; break;
             case ACTION_THRUST_UP:
                 targetThrust = Math.min(1.0, targetThrust + 0.08);
                 break;
             case ACTION_THRUST_DOWN:
                 targetThrust = Math.max(0.0, targetThrust - 0.08);
                 break;
-            default: break;
         }
-        // Если целевой угол изменился (не HOLD и не LEVEL), сбрасываем интегратор
-        if (action !== ACTION_HOLD && action !== ACTION_LEVEL && targetAngle !== prevTargetAngle) {
+        // Сброс интегратора при резкой смене целевого угла
+        if (action !== ACTION_HOLD && action !== ACTION_LEVEL &&
+            targetAngle !== prevTargetAngle) {
             drone.angleErrorIntegral = 0;
         }
 
-        // Нижний уровень: ПИД-регулятор угла
+        // Нижний уровень: ПИД по углу.
+        // Коэффициенты подобраны с учётом инерции тела (~2295) и интегрирования Matter.js.
         const dt = 1/60;
-        const kP = 0.03, kI = 0.002, kD = 0.015;
+        const kP = 0.5, kI = 0.03, kD = 0.25;
         const error = targetAngle - drone.angle;
         drone.angleErrorIntegral += error * dt;
-        // Ограничение интегральной составляющей
-        const maxIntegral = 0.8 / kI; // примерно 400? лучше ограничить разумно
-        if (drone.angleErrorIntegral > 0.5) drone.angleErrorIntegral = 0.5;
-        if (drone.angleErrorIntegral < -0.5) drone.angleErrorIntegral = -0.5;
+        // Ограничение интегральной составляющей (anti-windup)
+        if (drone.angleErrorIntegral >  MAX_INTEGRAL) drone.angleErrorIntegral =  MAX_INTEGRAL;
+        if (drone.angleErrorIntegral < -MAX_INTEGRAL) drone.angleErrorIntegral = -MAX_INTEGRAL;
+
         const torque = kP * error + kI * drone.angleErrorIntegral - kD * drone.angularVelocity;
         drone.torque = torque;
 
-        // Приложение тяги
+        // Приложение тяги вдоль корпуса
         const thrustForce = targetThrust * 0.05;
         const upward = {
             x: Math.sin(drone.angle) * thrustForce,
@@ -518,16 +566,16 @@
         }
     }
 
+    // ---------- Наблюдение ----------
     function getState() {
         const targetX = isCargoAttached ? basePos.x : cargo.position.x;
         const targetY = isCargoAttached ? basePos.y : cargo.position.y;
         const dx = targetX - drone.position.x;
         const dy = targetY - drone.position.y;
-        // Очищаем массив лучей для визуализации
         radarRays = [];
-        const radarLeft = getRadarDistance(-Math.PI/4, true);
-        const radarCenter = getRadarDistance(0, true);
-        const radarRight = getRadarDistance(Math.PI/4, true);
+        const radarLeft   = getRadarDistance(-Math.PI/4, true);
+        const radarCenter = getRadarDistance(0,         true);
+        const radarRight  = getRadarDistance( Math.PI/4, true);
         return [
             drone.position.x / WIDTH,
             drone.position.y / HEIGHT,
@@ -541,12 +589,23 @@
             radarCenter,
             radarRight,
             targetAngle / Math.PI,
-            targetThrust
+            targetThrust,
+            drone.angleErrorIntegral / MAX_INTEGRAL
         ];
     }
 
+    function currentDistance() {
+        const targetX = isCargoAttached ? basePos.x : cargo.position.x;
+        const targetY = isCargoAttached ? basePos.y : cargo.position.y;
+        const dx = targetX - drone.position.x;
+        const dy = targetY - drone.position.y;
+        return Math.sqrt(dx*dx + dy*dy);
+    }
+
+    // ---------- Один шаг симуляции ----------
     function simulationStep() {
         totalSteps++;
+        episodeSteps++;
         updateWind();
 
         const state = getState();
@@ -555,28 +614,22 @@
         Engine.update(engine, 1000/60);
 
         const nextState = getState();
-        const targetX = isCargoAttached ? basePos.x : cargo.position.x;
-        const targetY = isCargoAttached ? basePos.y : cargo.position.y;
-        const dx = targetX - drone.position.x;
-        const dy = targetY - drone.position.y;
-        const distAfter = Math.sqrt(dx*dx + dy*dy);
+        const distAfter = currentDistance();
 
-        const prevDist = Math.sqrt(
-            Math.pow(targetX - (drone.position.x - drone.velocity.x * 0.016), 2) +
-            Math.pow(targetY - (drone.position.y - drone.velocity.y * 0.016), 2)
-        );
-        let reward = (prevDist - distAfter) * 12;
+        // Награда за прогресс: изменение расстояния до цели за шаг
+        let reward = (lastDistance - distAfter) * 0.5;
+        lastDistance = distAfter;
 
-        // Штраф за близость к препятствиям по радару
-        if (nextState[8] < 0.25 || nextState[9] < 0.25 || nextState[10] < 0.25) reward -= 0.5;
-        reward -= 0.01; // небольшой штраф за время
+        // Штраф за близость к препятствиям
+        if (nextState[8] < 0.25 || nextState[9] < 0.25 || nextState[10] < 0.25) reward -= 0.3;
+        reward -= 0.02; // штраф за время
 
         let done = false;
 
         // Захват груза
         if (!isCargoAttached && distAfter < 45) {
             isCargoAttached = true;
-            reward += 200;
+            reward += 50;
             cargoConstraint = Constraint.create({
                 bodyA: drone, bodyB: cargo,
                 length: 45, stiffness: 0.7, damping: 0.1,
@@ -585,11 +638,13 @@
             Composite.add(world, cargoConstraint);
             document.getElementById('drone-status').innerText = "Возврат на базу";
             document.getElementById('drone-status').style.color = "#00e676";
+            // Цель сменилась — пересчитываем lastDistance
+            lastDistance = currentDistance();
         }
 
         // Доставка на базу
         if (isCargoAttached && distAfter < 55 && drone.position.x < 250) {
-            reward += 500;
+            reward += 100;
             done = true;
         }
 
@@ -600,36 +655,39 @@
         const isOnGround = Query.collides(drone, [ground]).length > 0;
 
         if (isUpsideDown && isOnGround) {
-            reward = -200;
+            reward = -50;
             done = true;
         } else if (hitHazard || outOfBounds) {
-            reward = -150;
+            reward = -50;
             done = true;
-        } else if (totalSteps > MAX_STEPS) {
-            reward -= 50;
+        } else if (episodeSteps > MAX_STEPS) {
+            reward -= 20;
             done = true;
-        } else if (safeSteps < 20) {
-            safeSteps++;
         } else {
+            // Штраф за сильное вращение в опасном положении
             if (Math.abs(drone.angle) > Math.PI/1.8 && drone.angularVelocity * drone.angle > 0.1) {
-                reward -= 1.0;
+                reward -= 0.5;
             }
         }
 
+        episodeReward += reward;
+
         agent.remember(state, action, reward, nextState, done);
         agent.replay();
+        agent.decayEpsilon();
 
-        if (done) {
-            resetScene();
-        }
+        if (done) resetScene();
 
-        // Обновление интерфейса каждые 5 шагов
+        // Обновление интерфейса
         if (totalSteps % 5 === 0) {
-            document.getElementById('steps-count').innerText = totalSteps;
-            document.getElementById('reward-val').innerText = reward.toFixed(2);
+            document.getElementById('steps-count').innerText = episodeSteps;
+            document.getElementById('reward-val').innerText = episodeReward.toFixed(1);
             document.getElementById('epsilon-val').innerText = agent.epsilon.toFixed(3);
-            document.getElementById('target-angle-val').innerText = (targetAngle * 180 / Math.PI).toFixed(1) + '°';
+            document.getElementById('target-angle-val').innerText =
+                (targetAngle * 180 / Math.PI).toFixed(1) + '°';
             document.getElementById('target-thrust-val').innerText = targetThrust.toFixed(2);
+            document.getElementById('memory-val').innerText = agent.memory.length;
+
             const dirEl = document.getElementById('angle-dir');
             if (targetAngle < -0.02) { dirEl.innerText = '←'; dirEl.style.color = '#00bcd4'; }
             else if (targetAngle > 0.02) { dirEl.innerText = '→'; dirEl.style.color = '#ff5722'; }
@@ -650,11 +708,9 @@
 
     function resetScene() {
         episodes++;
-        agent.epsilon = Math.max(agent.epsilonMin, agent.epsilon * agent.epsilonDecay);
-        totalSteps = 0;
-        safeSteps = 0;
+        episodeSteps = 0;
+        episodeReward = 0;
         document.getElementById('episodes-count').innerText = episodes;
-        document.getElementById('steps-count').innerText = totalSteps;
 
         if (cargoConstraint) {
             Composite.remove(world, cargoConstraint);
@@ -673,18 +729,22 @@
         Body.setAngle(drone, 0);
         Body.setAngularVelocity(drone, 0);
         drone.torque = 0;
+        drone.force.x = 0; drone.force.y = 0;
 
         Body.setPosition(cargo, { x: 700, y: 450 });
         Body.setVelocity(cargo, { x: 0, y: 0 });
         Body.setAngle(cargo, 0);
         Body.setAngularVelocity(cargo, 0);
+        cargo.force.x = 0; cargo.force.y = 0;
+
+        lastDistance = currentDistance();
     }
 
     function gameLoop() {
         for (let i = 0; i < simSpeed; i++) simulationStep();
         Render.world(render);
         const ctx = render.canvas.getContext('2d');
-        // Рисуем лучи радара
+
         if (radarRays.length > 0) {
             ctx.save();
             radarRays.forEach(ray => {
@@ -701,7 +761,9 @@
         requestAnimationFrame(gameLoop);
     }
 
-    // ========== Управление скоростью и ветром ==========
+    // ============================================================
+    // 4. UI
+    // ============================================================
     document.getElementById('speed-btn').addEventListener('click', () => {
         simSpeed = simSpeed === 1 ? 4 : 1;
         const btn = document.getElementById('speed-btn');
@@ -727,16 +789,18 @@
         }
     });
 
-    // ========== Сохранение / загрузка модели ==========
     document.getElementById('save-btn').addEventListener('click', () => {
-        const data = agent.getWeightsData();
-        // Глубокая копия для сериализации (массивы)
-        localStorage.setItem('drone_dqn_model', JSON.stringify(data));
-        alert('Модель сохранена в localStorage.');
+        try {
+            const data = agent.getWeightsData();
+            localStorage.setItem('drone_dqn_model_v2', JSON.stringify(data));
+            alert('Модель сохранена в localStorage.');
+        } catch (e) {
+            alert('Ошибка сохранения: ' + e.message);
+        }
     });
 
     document.getElementById('load-btn').addEventListener('click', () => {
-        const json = localStorage.getItem('drone_dqn_model');
+        const json = localStorage.getItem('drone_dqn_model_v2');
         if (!json) {
             alert('Сохранённая модель не найдена.');
             return;
@@ -744,12 +808,31 @@
         try {
             const data = JSON.parse(json);
             agent.setWeightsData(data);
-            alert('Модель загружена.');
+            alert('Модель загружена. ε = ' + agent.epsilon.toFixed(3));
         } catch (e) {
-            alert('Ошибка загрузки модели.');
+            alert('Ошибка загрузки модели: ' + e.message);
         }
     });
 
+    document.getElementById('reset-btn').addEventListener('click', () => {
+        if (!confirm('Сбросить агента (веса, память, ε, эпизоды)?')) return;
+        agent.model = new NeuralNetwork([STATE_SIZE, 128, 64, NUM_ACTIONS]);
+        agent.targetModel = new NeuralNetwork([STATE_SIZE, 128, 64, NUM_ACTIONS]);
+        agent.updateTargetModel();
+        agent.memory = [];
+        agent.epsilon = 1.0;
+        agent.stepsSinceTargetUpdate = 0;
+        episodes = 0;
+        totalSteps = 0;
+        episodeSteps = 0;
+        episodeReward = 0;
+        document.getElementById('episodes-count').innerText = 0;
+        document.getElementById('steps-count').innerText = 0;
+        resetScene();
+    });
+
+    // Инициализация и запуск
+    resetScene();
     gameLoop();
 </script>
 </body>
